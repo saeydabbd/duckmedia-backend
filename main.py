@@ -4,6 +4,7 @@ import urllib.parse
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import httpx
 
 app = FastAPI(title="DuckMedia Downloader Backend")
@@ -17,96 +18,16 @@ app.add_middleware(
 )
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+COOKIE_PATH = "cookies.txt" if os.path.exists("cookies.txt") else None
 
 @app.get("/")
 def home():
-    return {"status": "online", "message": "DuckMedia Universal Engine is Running 🦆"}
-
-# --- محرك يوتيوب المتخصص (تجاوز حظر Datacenter IP) ---
-async def resolve_youtube(url: str, is_audio: bool):
-    # تطبيع الرابط لضمان توافقه التام مع محركات الفحص (Shorts و youtu.be)
-    target_url = url
-    if "/shorts/" in target_url:
-        s_match = re.search(r'shorts/([a-zA-Z0-9_-]+)', target_url)
-        if s_match:
-            target_url = f"https://www.youtube.com/watch?v={s_match.group(1)}"
-    elif "youtu.be/" in target_url:
-        y_match = re.search(r'youtu\.be/([a-zA-Z0-9_-]+)', target_url)
-        if y_match:
-            target_url = f"https://www.youtube.com/watch?v={y_match.group(1)}"
-
-    encoded = urllib.parse.quote(target_url)
-
-    # المحرك 1: Dorratz السريع
-    try:
-        ep = f"https://api.dorratz.com/ytmp3?url={encoded}" if is_audio else f"https://api.dorratz.com/ytmp4?url={encoded}"
-        async with httpx.AsyncClient(timeout=14.0, follow_redirects=True) as client:
-            res = await client.get(ep, headers={"User-Agent": USER_AGENT})
-            data = res.json()
-            if data.get("status") and "data" in data:
-                media_link = data["data"].get("mp3") if is_audio else data["data"].get("mp4")
-                if media_link:
-                    return {
-                        "title": data["data"].get("title", "صوت YouTube MP3" if is_audio else "فيديو YouTube"),
-                        "cover": data["data"].get("thumbnail", ""),
-                        "url": media_link
-                    }
-    except Exception:
-        pass
-
-    # المحرك 2: BK9
-    try:
-        ep = f"https://bk9.fun/download/youtube-audio?url={encoded}" if is_audio else f"https://bk9.fun/download/youtube?url={encoded}"
-        async with httpx.AsyncClient(timeout=14.0, follow_redirects=True) as client:
-            res = await client.get(ep, headers={"User-Agent": USER_AGENT})
-            data = res.json()
-            if data.get("status") and "BK9" in data:
-                bk = data["BK9"]
-                media_link = bk.get("downloadUrl") or bk.get("url")
-                if media_link:
-                    return {
-                        "title": bk.get("title", "صوت YouTube MP3" if is_audio else "فيديو YouTube"),
-                        "cover": bk.get("thumbnail", ""),
-                        "url": media_link
-                    }
-    except Exception:
-        pass
-
-    # المحرك 3: Siputzx
-    try:
-        ep = f"https://api.siputzx.my.id/api/d/ytmp3?url={encoded}" if is_audio else f"https://api.siputzx.my.id/api/d/ytmp4?url={encoded}"
-        async with httpx.AsyncClient(timeout=14.0, follow_redirects=True) as client:
-            res = await client.get(ep, headers={"User-Agent": USER_AGENT})
-            data = res.json()
-            if data.get("status") and "data" in data:
-                dl = data["data"].get("dl")
-                if dl:
-                    return {
-                        "title": data["data"].get("title", "صوت YouTube MP3" if is_audio else "فيديو YouTube"),
-                        "cover": data["data"].get("thumbnail", ""),
-                        "url": dl
-                    }
-    except Exception:
-        pass
-
-    # المحرك 4: Agatz
-    try:
-        ep = f"https://api.agatz.xyz/api/ytmp3?url={encoded}" if is_audio else f"https://api.agatz.xyz/api/ytmp4?url={encoded}"
-        async with httpx.AsyncClient(timeout=14.0, follow_redirects=True) as client:
-            res = await client.get(ep, headers={"User-Agent": USER_AGENT})
-            data = res.json()
-            if data.get("status") == 200 and "data" in data:
-                dl = data["data"].get("downloadUrl") or data["data"].get("url")
-                if dl:
-                    return {
-                        "title": data["data"].get("title", "صوت YouTube MP3" if is_audio else "فيديو YouTube"),
-                        "cover": "",
-                        "url": dl
-                    }
-    except Exception:
-        pass
-
-    return None
+    has_cookies = "مفعّل ✅" if COOKIE_PATH else "غير موجود ⚠️"
+    return {
+        "status": "online",
+        "message": "DuckMedia Backend is Running 🦆",
+        "cookies": has_cookies
+    }
 
 # --- محرك فيسبوك المعتمد ---
 async def fallback_facebook(url: str):
@@ -157,6 +78,7 @@ async def fallback_instagram(url: str):
                 continue
     return None
 
+# --- فك روابط الوسائط وتجهيزها ---
 @app.get("/api/resolve")
 async def resolve_media(request: Request, url: str = Query(...), format: str = Query("video")):
     is_audio = (format == "audio")
@@ -166,18 +88,41 @@ async def resolve_media(request: Request, url: str = Query(...), format: str = Q
     is_fb = any(d in target_url.lower() for d in ["facebook.com", "fb.watch"])
     is_ig = "instagram.com" in target_url.lower()
 
-    # توجيه يوتيوب فوراً للمحرك المخصص لتجاوز حظر Datacenter IP
+    # معالجة يوتيوب باستخدام الكوكيز والبث المباشر
     if is_yt:
-        yt_res = await resolve_youtube(target_url, is_audio)
-        if yt_res and yt_res.get("url"):
-            return {
-                "success": True,
-                "title": yt_res.get("title", "وسائط DuckMedia"),
-                "cover": yt_res.get("cover", ""),
-                "downloadUrl": yt_res["url"],
-                "type": "audio" if is_audio else "video"
-            }
-        raise HTTPException(status_code=400, detail="تعذر استخراج فيديو يوتيوب حالياً. يرجى تجربة مقطع آخر.")
+        if "/shorts/" in target_url:
+            s_match = re.search(r'shorts/([a-zA-Z0-9_-]+)', target_url)
+            if s_match:
+                target_url = f"https://www.youtube.com/watch?v={s_match.group(1)}"
+
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'noplaylist': True,
+            'format': 'bestaudio/best' if is_audio else 'best[ext=mp4]/best',
+            'cookiefile': COOKIE_PATH,
+            'http_headers': {'User-Agent': USER_AGENT}
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target_url, download=False)
+                if info:
+                    title = info.get("title", "وسائط YouTube")
+                    cover = info.get("thumbnail", "")
+                    base_url = str(request.base_url).rstrip("/")
+                    encoded_url = urllib.parse.quote(target_url)
+                    # توجيه الهاتف إلى البث المباشر عبر السيرفر لتجاوز حظر الـ IP
+                    stream_url = f"{base_url}/api/stream?url={encoded_url}&format={format}"
+                    return {
+                        "success": True,
+                        "title": title,
+                        "cover": cover,
+                        "downloadUrl": stream_url,
+                        "type": "audio" if is_audio else "video"
+                    }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"خطأ يوتيوب: {str(e)}")
 
     # معالجة روابط فيسبوك وإنستغرام
     if "facebook.com/reel/" in target_url:
@@ -197,18 +142,14 @@ async def resolve_media(request: Request, url: str = Query(...), format: str = Q
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
-            if info:
-                title = info.get("title", "وسائط DuckMedia")
-                cover = info.get("thumbnail", "")
-                download_url = info.get("url")
-                if download_url:
-                    return {
-                        "success": True,
-                        "title": title,
-                        "cover": cover,
-                        "downloadUrl": download_url,
-                        "type": "audio" if is_audio else "video"
-                    }
+            if info and info.get("url"):
+                return {
+                    "success": True,
+                    "title": info.get("title", "وسائط DuckMedia"),
+                    "cover": info.get("thumbnail", ""),
+                    "downloadUrl": info.get("url"),
+                    "type": "audio" if is_audio else "video"
+                }
     except Exception:
         pass
 
@@ -228,3 +169,35 @@ async def resolve_media(request: Request, url: str = Query(...), format: str = Q
         }
 
     raise HTTPException(status_code=400, detail="تعذر معالجة هذا المقطع. تأكد من أن الرابط عام وصحيح.")
+
+# --- نقطة بث الفيديو لتخطي حظر 403 Forbidden ---
+@app.get("/api/stream")
+async def stream_media(url: str = Query(...), format: str = Query("video")):
+    is_audio = (format == "audio")
+    ydl_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'format': 'bestaudio/best' if is_audio else 'best[ext=mp4]/best',
+        'cookiefile': COOKIE_PATH,
+        'http_headers': {'User-Agent': USER_AGENT}
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            direct_stream_url = info.get("url")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"تعذر استخراج الرابط للبث: {str(e)}")
+
+    if not direct_stream_url:
+        raise HTTPException(status_code=404, detail="رابط البث غير متاح.")
+
+    async def stream_generator():
+        headers = {'User-Agent': USER_AGENT}
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", direct_stream_url, headers=headers) as resp:
+                async for chunk in resp.aiter_bytes(chunk_size=1024 * 64):
+                    yield chunk
+
+    media_type = "audio/mpeg" if is_audio else "video/mp4"
+    return StreamingResponse(stream_generator(), media_type=media_type)
