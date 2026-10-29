@@ -1,9 +1,11 @@
 import os
 import re
+import time
 import urllib.parse
 import yt_dlp
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import httpx
 
 app = FastAPI(title="DuckMedia Downloader Backend")
@@ -26,214 +28,6 @@ def home():
         "message": "DuckMedia Universal Engine is Running 🦆",
         "cookies": "مفعّل ✅" if COOKIE_PATH else "غير موجود ⚠️"
     }
-
-def get_youtube_id(url: str):
-    patterns = [
-        r'(?:v=|\/vi\/|youtu\.be\/|\/embed\/|\/shorts\/)([a-zA-Z0-9_-]{11})',
-        r'(?:watch\?.*v=)([a-zA-Z0-9_-]{11})',
-        r'^([a-zA-Z0-9_-]{11})$'
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    return None
-
-# --- محرك يوتيوب 1: Y2Mate (سريع ويدمج الصوت والصورة مسبقاً) ---
-async def resolve_y2mate(url: str, is_audio: bool):
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Referer": "https://www.y2mate.com/",
-        "Origin": "https://www.y2mate.com",
-        "X-Requested-With": "XMLHttpRequest"
-    }
-    async with httpx.AsyncClient(timeout=14.0, headers=headers, follow_redirects=True) as client:
-        res = await client.post(
-            "https://www.y2mate.com/mates/analyzeV2/ajax",
-            data={"k_query": url, "k_page": "home", "hl": "en", "q_auto": "0"}
-        )
-        data = res.json()
-        if data.get("status") != "success":
-            return None
-
-        vid = data.get("vid")
-        title = data.get("title", "فيديو YouTube")
-        links = data.get("links", {})
-        k = None
-
-        if is_audio:
-            mp3_links = links.get("mp3", {})
-            for key in ["mp3128", "auto", "mp3"]:
-                if key in mp3_links:
-                    k = mp3_links[key].get("k")
-                    break
-            if not k and mp3_links:
-                k = list(mp3_links.values())[0].get("k")
-        else:
-            mp4_links = links.get("mp4", {})
-            for key in ["auto", "136", "18", "22", "135", "134"]:
-                if key in mp4_links:
-                    k = mp4_links[key].get("k")
-                    break
-            if not k and mp4_links:
-                k = list(mp4_links.values())[0].get("k")
-
-        if not k:
-            return None
-
-        conv_res = await client.post(
-            "https://www.y2mate.com/mates/convertV2/index",
-            data={"vid": vid, "k": k}
-        )
-        c_data = conv_res.json()
-        if c_data.get("status") == "success" and c_data.get("dlink"):
-            return {
-                "title": title,
-                "cover": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-                "url": c_data["dlink"]
-            }
-    return None
-
-# --- محرك يوتيوب 2: Vevioz ---
-async def resolve_vevioz(vid: str, is_audio: bool):
-    endpoint = f"https://api.vevioz.com/api/button/{'mp3' if is_audio else 'videos'}/{vid}"
-    headers = {"User-Agent": USER_AGENT}
-    async with httpx.AsyncClient(timeout=10.0, headers=headers, follow_redirects=True) as client:
-        res = await client.get(endpoint)
-        data = res.json()
-        if data.get("url"):
-            return {
-                "title": data.get("title", "وسائط YouTube"),
-                "cover": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-                "url": data["url"]
-            }
-    return None
-
-# --- محرك يوتيوب 3: الخوادم البديلة المشتركة ---
-async def resolve_external_yt(url: str, is_audio: bool, vid: str):
-    encoded = urllib.parse.quote(url)
-    endpoints = [
-        f"https://api.dorratz.com/{'ytmp3' if is_audio else 'ytmp4'}?url={encoded}",
-        f"https://api.siputzx.my.id/api/d/{'ytmp3' if is_audio else 'ytmp4'}?url={encoded}",
-        f"https://bk9.fun/download/{'youtube-audio' if is_audio else 'youtube'}?url={encoded}"
-    ]
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-        for ep in endpoints:
-            try:
-                res = await client.get(ep, headers={"User-Agent": USER_AGENT})
-                data = res.json()
-                if data.get("status") and "data" in data and isinstance(data["data"], dict):
-                    link = data["data"].get("mp3" if is_audio else "mp4") or data["data"].get("dl")
-                    if link:
-                        return {
-                            "title": data["data"].get("title", "وسائط YouTube"),
-                            "cover": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-                            "url": link
-                        }
-                if data.get("status") and "BK9" in data:
-                    bk = data["BK9"]
-                    link = bk.get("downloadUrl") or bk.get("url")
-                    if link:
-                        return {
-                            "title": bk.get("title", "وسائط YouTube"),
-                            "cover": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-                            "url": link
-                        }
-            except Exception:
-                continue
-    return None
-
-# --- محرك يوتيوب 4: yt-dlp عبر نمط أجهزة التلفاز (TV Embedded) ---
-async def resolve_ytdlp_direct(url: str, is_audio: bool, vid: str):
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'noplaylist': True,
-        'cookiefile': COOKIE_PATH,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['tv_embedded', 'tv', 'android_vr']
-            }
-        },
-        'http_headers': {'User-Agent': USER_AGENT}
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                return None
-            formats = info.get("formats", [])
-            if is_audio:
-                audio_formats = [f for f in formats if f.get("acodec") != "none" and f.get("url")]
-                if audio_formats:
-                    audio_formats.sort(key=lambda x: x.get("abr") or x.get("tbr") or 0, reverse=True)
-                    return {
-                        "title": info.get("title", "صوت YouTube"),
-                        "cover": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-                        "url": audio_formats[0]["url"]
-                    }
-            else:
-                prog = [f for f in formats if f.get("acodec") != "none" and f.get("vcodec") != "none" and f.get("url")]
-                if prog:
-                    prog.sort(key=lambda x: x.get("height") or x.get("tbr") or 0, reverse=True)
-                    return {
-                        "title": info.get("title", "فيديو YouTube"),
-                        "cover": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-                        "url": prog[0]["url"]
-                    }
-                valid = [f for f in formats if f.get("url")]
-                if valid:
-                    valid.sort(key=lambda x: x.get("height") or x.get("tbr") or 0, reverse=True)
-                    return {
-                        "title": info.get("title", "فيديو YouTube"),
-                        "cover": f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-                        "url": valid[0]["url"]
-                    }
-    except Exception:
-        pass
-    return None
-
-# تجميع محركات يوتيوب مع التحويل التلقائي
-async def resolve_youtube(url: str, is_audio: bool):
-    vid = get_youtube_id(url)
-    if not vid:
-        return None
-    normalized_url = f"https://www.youtube.com/watch?v={vid}"
-
-    # 1. Y2Mate
-    try:
-        res = await resolve_y2mate(normalized_url, is_audio)
-        if res and res.get("url"):
-            return res
-    except Exception:
-        pass
-
-    # 2. Vevioz
-    try:
-        res = await resolve_vevioz(vid, is_audio)
-        if res and res.get("url"):
-            return res
-    except Exception:
-        pass
-
-    # 3. External APIs
-    try:
-        res = await resolve_external_yt(normalized_url, is_audio, vid)
-        if res and res.get("url"):
-            return res
-    except Exception:
-        pass
-
-    # 4. yt-dlp (TV Mode)
-    try:
-        res = await resolve_ytdlp_direct(normalized_url, is_audio, vid)
-        if res and res.get("url"):
-            return res
-    except Exception:
-        pass
-
-    return None
 
 # --- محرك فيسبوك المعتمد الناجح ---
 async def fallback_facebook(url: str):
@@ -284,7 +78,7 @@ async def fallback_instagram(url: str):
                 continue
     return None
 
-# --- النقطة الرئيسية لتجهيز روابط التنزيل ---
+# --- فحص المقطع واستخراج معلوماته ---
 @app.get("/api/resolve")
 async def resolve_media(request: Request, url: str = Query(...), format: str = Query("video")):
     is_audio = (format == "audio")
@@ -294,18 +88,43 @@ async def resolve_media(request: Request, url: str = Query(...), format: str = Q
     is_fb = any(d in target_url.lower() for d in ["facebook.com", "fb.watch"])
     is_ig = "instagram.com" in target_url.lower()
 
-    # مسار يوتيوب عبر المحركات المتتالية
+    # مسار يوتيوب (Shorts وفيديوهات عادية)
     if is_yt:
-        yt_res = await resolve_youtube(target_url, is_audio)
-        if yt_res and yt_res.get("url"):
-            return {
-                "success": True,
-                "title": yt_res.get("title", "وسائط YouTube"),
-                "cover": yt_res.get("cover", ""),
-                "downloadUrl": yt_res["url"],
-                "type": "audio" if is_audio else "video"
-            }
-        raise HTTPException(status_code=400, detail="تعذر استخراج فيديو YouTube حالياً. يرجى تجربة مقطع آخر.")
+        if "/shorts/" in target_url:
+            s_match = re.search(r'shorts/([a-zA-Z0-9_-]+)', target_url)
+            if s_match:
+                target_url = f"https://www.youtube.com/watch?v={s_match.group(1)}"
+
+        # استخراج معلومات الفيديو دون تقييد الصيغة لتفادي أي خطأ
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'noplaylist': True,
+            'cookiefile': COOKIE_PATH,
+            'http_headers': {'User-Agent': USER_AGENT}
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target_url, download=False)
+                if not info:
+                    raise Exception("تعذر قراءة بيانات المقطع من YouTube.")
+
+                title = info.get("title", "وسائط YouTube")
+                cover = info.get("thumbnail", "")
+                base_url = str(request.base_url).rstrip("/")
+                encoded_url = urllib.parse.quote(target_url)
+                download_url = f"{base_url}/api/stream?url={encoded_url}&format={format}"
+
+                return {
+                    "success": True,
+                    "title": title,
+                    "cover": cover,
+                    "downloadUrl": download_url,
+                    "type": "audio" if is_audio else "video"
+                }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"خطأ يوتيوب: {str(e)}")
 
     # مسار فيسبوك وإنستغرام
     if "facebook.com/reel/" in target_url:
@@ -352,3 +171,67 @@ async def resolve_media(request: Request, url: str = Query(...), format: str = Q
         }
 
     raise HTTPException(status_code=400, detail="تعذر معالجة هذا المقطع. تأكد من أن الرابط عام وصحيح.")
+
+# --- محرك دمج وبث وسائط يوتيوب عبر FFmpeg ---
+@app.get("/api/stream")
+def stream_media(background_tasks: BackgroundTasks, url: str = Query(...), format: str = Query("video")):
+    is_audio = (format == "audio")
+    file_id = f"duck_{int(time.time())}_{os.urandom(4).hex()}"
+    out_tmpl = f"/tmp/{file_id}.%(ext)s"
+
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': COOKIE_PATH,
+        'outtmpl': out_tmpl,
+        'noplaylist': True,
+        'http_headers': {'User-Agent': USER_AGENT}
+    }
+
+    if is_audio:
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '320',
+            }]
+        })
+    else:
+        ydl_opts.update({
+            'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+            'merge_output_format': 'mp4'
+        })
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"فشل معالجة المقطع عبر السيرفر: {str(e)}")
+
+    expected_ext = "mp3" if is_audio else "mp4"
+    target_file = f"/tmp/{file_id}.{expected_ext}"
+
+    if not os.path.exists(target_file):
+        matches = [os.path.join("/tmp", f) for f in os.listdir("/tmp") if f.startswith(file_id)]
+        if matches:
+            target_file = matches[0]
+
+    if not os.path.exists(target_file):
+        raise HTTPException(status_code=404, detail="تعذر العثور على الملف المعالج.")
+
+    def cleanup():
+        try:
+            if os.path.exists(target_file):
+                os.remove(target_file)
+        except Exception:
+            pass
+
+    background_tasks.add_task(cleanup)
+
+    media_type = "audio/mpeg" if is_audio else "video/mp4"
+    return FileResponse(
+        target_file,
+        media_type=media_type,
+        filename=f"duckmedia_{file_id}.{expected_ext}"
+    )
