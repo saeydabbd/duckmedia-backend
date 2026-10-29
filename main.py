@@ -8,7 +8,6 @@ import httpx
 
 app = FastAPI(title="DuckMedia Downloader Backend")
 
-# السماح للاتصال من تطبيق الهاتف بدون قيود
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,6 +15,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# إعدادات تخطي حماية يوتيوب وخوادم السحاب
+YOUTUBE_EXTRACTOR_ARGS = {
+    'youtube': {
+        'player_client': ['ios', 'android', 'mweb'],
+    }
+}
+
+IOS_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'
 
 @app.get("/")
 def home():
@@ -32,6 +40,11 @@ async def resolve_media(request: Request, url: str = Query(...), format: str = Q
         'skip_download': True,
         'noplaylist': True,
         'format': 'bestaudio/best' if is_audio else 'best[ext=mp4]/best',
+        'extractor_args': YOUTUBE_EXTRACTOR_ARGS,
+        'http_headers': {
+            'User-Agent': IOS_USER_AGENT,
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
     }
 
     try:
@@ -43,7 +56,6 @@ async def resolve_media(request: Request, url: str = Query(...), format: str = Q
             title = info.get("title", "وسائط DuckMedia")
             cover = info.get("thumbnail", "")
             
-            # إذا كان الرابط من يوتيوب، نوجهه لنقطة البث بالسيرفر لتجاوز حظر IP جوجل (403)
             base_url = str(request.base_url).rstrip("/")
             if is_youtube:
                 encoded_url = urllib.parse.quote(url)
@@ -68,23 +80,29 @@ async def stream_media(url: str = Query(...), format: str = Query("video")):
         'quiet': True,
         'skip_download': True,
         'format': 'bestaudio/best' if is_audio else 'best[ext=mp4]/best',
+        'extractor_args': YOUTUBE_EXTRACTOR_ARGS,
+        'http_headers': {
+            'User-Agent': IOS_USER_AGENT,
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        direct_stream_url = info.get("url")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            direct_stream_url = info.get("url")
 
-    if not direct_stream_url:
-        raise HTTPException(status_code=404, detail="تعذر جلب تيار البث.")
+        if not direct_stream_url:
+            raise HTTPException(status_code=404, detail="تعذر جلب تيار البث.")
 
-    async def stream_generator():
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("GET", direct_stream_url, headers=headers) as resp:
-                async for chunk in resp.aiter_bytes(chunk_size=1024 * 64):
-                    yield chunk
+        async def stream_generator():
+            headers = {'User-Agent': IOS_USER_AGENT}
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", direct_stream_url, headers=headers) as resp:
+                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 64):
+                        yield chunk
 
-    media_type = "audio/mpeg" if is_audio else "video/mp4"
-    return StreamingResponse(stream_generator(), media_type=media_type)
+        media_type = "audio/mpeg" if is_audio else "video/mp4"
+        return StreamingResponse(stream_generator(), media_type=media_type)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
